@@ -68,7 +68,6 @@ type task struct {
 	Active   int              `json:"active,omitempty"`
 	State    taskState        `json:"state"`
 	Error    string           `json:"error,omitempty"`
-	Progress *engine.Progress `json:"-"`
 }
 
 // ---------- 引擎事件收集器 ----------
@@ -94,7 +93,6 @@ func (c *collector) SetProgress(id engine.RunID, p engine.Progress) {
 	if !ok {
 		return
 	}
-	t.Progress = &p
 	t.Hash = p.Hash.String()
 	t.Size = p.Size
 	t.Received = p.Received
@@ -202,10 +200,10 @@ type config struct {
 }
 
 type statusJSON struct {
-	Engine  bool             `json:"engine"`
-	Updated int64            `json:"updated"`
-	Network engine.Network   `json:"network"`
-	Tasks   []*task          `json:"tasks"`
+	Engine  bool           `json:"engine"`
+	Updated int64          `json:"updated"`
+	Network map[string]any `json:"network"`
+	Tasks   []*task        `json:"tasks"`
 }
 
 func (d *daemon) status() statusJSON {
@@ -219,11 +217,18 @@ func (d *daemon) status() statusJSON {
 		}
 		list = append(list, &cp)
 	}
+	n := d.col.network
 	return statusJSON{
 		Engine:  d.col.engineOn,
 		Updated: time.Now().Unix(),
-		Network: d.col.network,
-		Tasks:   list,
+		Network: map[string]any{
+			"server":       n.IsServerConnected,
+			"highId":       n.IsHighID,
+			"kadFirewalled": n.IsKadFirewalled,
+			"kadNodes":     n.KadNodes,
+			"carrierNat":   n.IsBehindCarrierNat,
+		},
+		Tasks: list,
 	}
 }
 
@@ -455,7 +460,17 @@ func main() {
 			}
 			return e, nil
 		})
+		// gateway 退出（含引擎启动失败）后必须关写端，
+		// 否则主流程 ReadString 永远阻塞 => 死锁
+		engineOutW.Close()
 	}()
+
+	// 端口探测：被占则快速失败（否则引擎 START_FAILED 后主流程死锁）
+	if ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.port)); err != nil {
+		log.Fatalf("eD2k 端口 %d 被占用（旧实例还活着？）: %v", cfg.port, err)
+	} else {
+		ln.Close()
+	}
 
 	// 发 hello
 	hello := map[string]any{
@@ -509,7 +524,9 @@ func main() {
 		}
 	}
 	if !ready {
-		log.Fatal("引擎 30 秒内未就绪")
+		// 引擎启动失败（如端口冲突）后 gateway.Run 已返回，
+		// 管道不会再有输出，继续等会死锁 —— 必须立即退出
+		log.Fatal("引擎 30 秒内未就绪，退出（详见上方日志）")
 	}
 
 	// 持续读引擎事件：gateway 把引擎事件序列化到 stdout（不直接调 collector，
