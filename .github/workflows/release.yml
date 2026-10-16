@@ -36,6 +36,11 @@ jobs:
           - goos: linux
             goarch: arm
             ext: ""
+          - goos: linux
+            goarch: arm
+            ext: ""
+            pkg: ./cmd/kelpied
+            bin: kelpied
 
     steps:
       - uses: actions/checkout@v7
@@ -48,15 +53,22 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: "7"
           CGO_ENABLED: "0"
         run: |
-          OUTPUT="kelpie-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUTPUT" ./cmd/kelpie
+          PKG="${{ matrix.pkg }}"
+          BIN="${{ matrix.bin }}"
+          [ -n "$PKG" ] || PKG=./cmd/kelpie
+          [ -n "$BIN" ] || BIN=kelpie
+          OUTPUT="${BIN}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o "$OUTPUT" "$PKG"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: kelpie-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: kelpie-*
+          name: ${{ matrix.bin || 'kelpie' }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            kelpie-*
+            kelpied-*
 
   release:
     needs: build
