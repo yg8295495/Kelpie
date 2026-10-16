@@ -80,10 +80,11 @@ type collector struct {
 	next     engine.RunID
 	network  engine.Network
 	engineOn bool
+	stopped  map[engine.RunID]bool // 主动 stop 的 run：ended 时候判别"完成"与"被停"
 }
 
 func newCollector() *collector {
-	return &collector{tasks: map[engine.RunID]*task{}}
+	return &collector{tasks: map[engine.RunID]*task{}, stopped: map[engine.RunID]bool{}}
 }
 
 func (c *collector) SetProgress(id engine.RunID, p engine.Progress) {
@@ -115,8 +116,11 @@ func (c *collector) SendEnded(id engine.RunID, err *engine.Error) {
 	if !ok {
 		return
 	}
-	if err == nil {
+	if err == nil && !c.stopped[id] {
 		t.State = stateDone
+		t.Error = ""
+	} else if err == nil {
+		t.State = stateStopped
 		t.Error = ""
 	} else {
 		t.State = stateFailed
@@ -124,6 +128,28 @@ func (c *collector) SendEnded(id engine.RunID, err *engine.Error) {
 	}
 	t.Rate = 0
 	t.Active = 0
+}
+
+// updateProgress 直接从 stdout 消息更新任务进度（hash 以字符串形式传来）
+func (c *collector) updateProgress(id engine.RunID, hash string, size, received, rate int64, peers, active int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.tasks[id]
+	if !ok {
+		return
+	}
+	t.Hash = hash
+	t.Size = size
+	t.Received = received
+	t.Rate = rate
+	t.Peers = peers
+	t.Active = active
+	if size > 0 {
+		t.Pct = int(received * 100 / size)
+	}
+	if t.State == statePending {
+		t.State = stateRunning
+	}
 }
 
 func (c *collector) SetNetwork(n engine.Network) {
@@ -486,7 +512,9 @@ func main() {
 		log.Fatal("引擎 30 秒内未就绪")
 	}
 
-	// 持续读引擎事件（更新 network / 任务状态）
+	// 持续读引擎事件：gateway 把引擎事件序列化到 stdout（不直接调 collector，
+	// collector 是作为 outbox 的 holder 传给引擎的，事件实际走 stdout 管道）。
+	// 这里解析 progress / network / ended 并更新任务表。
 	go func() {
 		for {
 			line, err := reader.ReadString('\n')
@@ -502,11 +530,48 @@ func main() {
 			var m struct {
 				Type string `json:"type"`
 				Run  uint64 `json:"run"`
+				// progress 字段
+				Hash         string `json:"hash"`
+				Size         int64  `json:"size"`
+				Received     int64  `json:"received"`
+				DownloadRate int64  `json:"downloadRate"`
+				Peers        int    `json:"peers"`
+				ActivePeers  int    `json:"activePeers"`
+				// network 字段
+				IsServerConnected  bool   `json:"isServerConnected"`
+				IsHighID           bool   `json:"isHighId"`
+				IsKadFirewalled    bool   `json:"isKadFirewalled"`
+				KadNodes           int    `json:"kadNodes"`
+				IsBehindCarrierNat bool   `json:"isBehindCarrierNat"`
+				ProxyIssue         string `json:"proxyIssue"`
+				// ended 字段
+				Error *struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
 			}
-			_ = json.Unmarshal([]byte(line), &m)
-			// 事件本身已由 collector 通过 engine.Events 回调汇总，
-			// 这里只需把 network 同步出来（SetNetwork 也是回调）。
-			_ = m
+			if json.Unmarshal([]byte(line), &m) != nil {
+				continue
+			}
+			switch m.Type {
+			case "progress":
+				col.updateProgress(engine.RunID(m.Run), m.Hash, m.Size, m.Received, m.DownloadRate, m.Peers, m.ActivePeers)
+			case "network":
+				col.SetNetwork(engine.Network{
+					IsServerConnected:  m.IsServerConnected,
+					IsHighID:           m.IsHighID,
+					IsKadFirewalled:    m.IsKadFirewalled,
+					KadNodes:           m.KadNodes,
+					IsBehindCarrierNat: m.IsBehindCarrierNat,
+					ProxyIssue:         m.ProxyIssue,
+				})
+			case "ended":
+				var e *engine.Error
+				if m.Error != nil {
+					e = &engine.Error{Code: engine.CodeStartFailed, Message: m.Error.Message}
+				}
+				col.SendEnded(engine.RunID(m.Run), e)
+			}
 		}
 	}()
 
