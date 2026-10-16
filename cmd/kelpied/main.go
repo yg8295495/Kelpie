@@ -197,6 +197,7 @@ type config struct {
 	port       int
 	dlLimit    int64
 	ulLimit    int64
+	proxy      string // socks5:// 或 socks5h://，空则直连（ADR-0006）
 }
 
 type statusJSON struct {
@@ -454,6 +455,7 @@ func main() {
 	flag.IntVar(&cfg.port, "port", 4662, "eD2k TCP/UDP 端口")
 	flag.Int64Var(&cfg.dlLimit, "dl", 0, "下载限速 B/s，0 不限")
 	flag.Int64Var(&cfg.ulLimit, "ul", 0, "上传限速 B/s，0 不限")
+	flag.StringVar(&cfg.proxy, "proxy", "", "socks5 代理 URL（如 socks5://127.0.0.1:1070），引擎全部流量走此代理，绕开路由器透明代理的不确定性")
 	flag.Parse()
 
 	for _, dir := range []string{cfg.dataFolder, cfg.outDir, cfg.wwwDir} {
@@ -507,7 +509,7 @@ func main() {
 			"serverLists": []string{filepath.Join(cfg.dataFolder, "server.met")},
 			"nodeLists":   []string{filepath.Join(cfg.dataFolder, "nodes.dat")},
 			"traceFile":   "",
-			"proxy":       "",
+			"proxy":       cfg.proxy,
 		},
 		"rateLimits": map[string]any{
 			"download": cfg.dlLimit,
