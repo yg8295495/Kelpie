@@ -32,6 +32,9 @@ jobs:
           - goos: linux
             goarch: arm64
             ext: ""
+          - goos: linux
+            goarch: arm
+            ext: ""
 
     steps:
       - uses: actions/checkout@v7
