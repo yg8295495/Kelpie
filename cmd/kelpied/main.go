@@ -274,6 +274,7 @@ func (d *daemon) stop(id engine.RunID) error {
 	if t, ok := d.col.tasks[id]; ok && t.State == stateRunning {
 		t.State = stateStopped
 	}
+	d.col.stopped[id] = true
 	d.col.mu.Unlock()
 	return nil
 }
@@ -281,22 +282,34 @@ func (d *daemon) stop(id engine.RunID) error {
 func (d *daemon) resume(id engine.RunID) error {
 	d.col.mu.Lock()
 	t, ok := d.col.tasks[id]
-	d.col.mu.Unlock()
 	if !ok {
+		d.col.mu.Unlock()
 		return fmt.Errorf("任务 #%d 不存在", id)
 	}
+	if t.State == stateRunning {
+		d.col.mu.Unlock()
+		return fmt.Errorf("任务 #%d 正在下载，无需 resume", id)
+	}
+	// 必须换新 RunID：outbox 对已 ended 的 run 永久忽略后续事件（isEnded 不清除），
+	// 复用旧 id 会让 resume 后的 progress/ended 全被吞，任务永远显示 pending
+	d.col.next++
+	newID := d.col.next
+	delete(d.col.tasks, id)
+	delete(d.col.stopped, id)
+	t.ID = newID
+	t.State = statePending
+	d.col.tasks[newID] = t
+	d.col.mu.Unlock()
 	if err := d.br.send(map[string]any{
 		"type": "run",
-		"run":  id,
+		"run":  newID,
 		"mode": "download",
 		"link": t.Link,
 		"file": t.File,
 	}); err != nil {
 		return err
 	}
-	d.col.mu.Lock()
-	t.State = statePending
-	d.col.mu.Unlock()
+	log.Printf("任务 #%d 已以新 ID #%d 恢复: %s", id, newID, t.Name)
 	return nil
 }
 
@@ -311,8 +324,16 @@ func (d *daemon) remove(id engine.RunID, delFile bool) error {
 	if !ok {
 		return fmt.Errorf("任务 #%d 不存在", id)
 	}
-	if t.Hash != "" {
-		_ = d.br.send(map[string]any{"type": "remove", "hash": t.Hash})
+	// hash 优先取引擎上报的；还没收到 progress 时从 ed2k 链接解析，
+	// 否则引擎侧会留下孤儿 run 继续下载
+	hash := t.Hash
+	if hash == "" {
+		if parts := strings.Split(t.Link, "|"); len(parts) >= 6 {
+			hash = parts[4]
+		}
+	}
+	if hash != "" {
+		_ = d.br.send(map[string]any{"type": "remove", "hash": hash})
 	}
 	if delFile && t.File != "" {
 		if err := os.Remove(t.File); err != nil && !os.IsNotExist(err) {
@@ -460,9 +481,11 @@ func main() {
 			}
 			return e, nil
 		})
-		// gateway 退出（含引擎启动失败）后必须关写端，
-		// 否则主流程 ReadString 永远阻塞 => 死锁
+		// gateway 退出（含引擎启动失败）后必须关两端：
+		// engineOutW 不关 => 主流程 ReadString 永久阻塞（读死锁）
+		// engineInR 不关 => 之后任何 br.send 永久阻塞（写死锁，曾致僵尸进程）
 		engineOutW.Close()
+		engineInR.Close()
 	}()
 
 	// 端口探测：被占则快速失败（否则引擎 START_FAILED 后主流程死锁）
@@ -541,6 +564,15 @@ func main() {
 				}
 				col.mu.Lock()
 				col.engineOn = false
+				// 引擎没了，未终结任务不会再有事件 —— 标 failed 防永久 running
+				for _, t := range col.tasks {
+					if t.State == stateRunning || t.State == statePending {
+						t.State = stateFailed
+						t.Error = "引擎已退出"
+						t.Rate = 0
+						t.Active = 0
+					}
+				}
 				col.mu.Unlock()
 				return
 			}
